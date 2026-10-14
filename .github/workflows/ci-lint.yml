@@ -1,0 +1,42 @@
+name: ci-lint
+
+# Prueft die Workflows dieses Repos gegen den CI-Standard der
+# engineering-standards (Regeln: repo-setup reference/ci-standard.md).
+#
+# Fuer OEFFENTLICHE Repos (sie koennen den wiederverwendbaren Workflow aus dem
+# privaten Standards-Repo nicht aufrufen) und fuer alle, die den Linter lieber
+# kopieren:
+#   1. script/ci-lint aus <ORG>/engineering-standards nach script/ci-lint
+#      dieses Repos kopieren (Stand aus dessen VERSION im Commit nennen).
+#   2. Diese Datei nach .github/workflows/ci-lint.yml kopieren.
+# Required Check fuer die Branch Protection: "ci-lint".
+# Ob Findings den Check rot machen, entscheidet script/ci-lint anhand des
+# Markers: Team-Repos bekommen Hinweise (gruen), Solo-Repos einen roten Check.
+# Team-Repos, die blockieren wollen, haengen --enforce an den Aufruf an.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-lint:
+    name: ci-lint
+    # Oeffentliches Repo: GitHub-hosted Runner sind kostenlos.
+    runs-on: ubuntu-24.04
+    # Haengeschutz: der Lauf dauert Sekunden.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: ci-lint
+        env:
+          CI_LINT_VISIBILITY: ${{ github.event.repository.visibility }}
+        run: bash script/ci-lint --visibility "$CI_LINT_VISIBILITY"

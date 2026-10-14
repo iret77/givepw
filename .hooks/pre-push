@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Pre-push hook: block direct pushes to main/master.
+#
+# Behaviour depends on the repo's tier (field `tier:` in
+# .github/engineering-standards.yml; a missing field means team):
+#   team  every push to main/master is blocked — changes go through PRs.
+#   solo  a push to main/master is allowed when it is a fast-forward AND
+#         every changed path is documentation (matches DOCS_ONLY_PATTERN).
+#         Renames count with BOTH paths (moving code into docs/ is not
+#         docs-only). Creating or deleting main/master, non-fast-forward
+#         pushes and any git error are blocked (fetch first).
+#
+# Override (emergencies only): ALLOW_PUSH_TO_MAIN=1 git push origin main
+
+readonly PROTECTED_BRANCH_RE='^(main|master)$'
+readonly DOCS_ONLY_PATTERN='(^docs/|\.md$)'
+readonly ZERO_SHA_RE='^0+$'
+readonly MARKER_REL='.github/engineering-standards.yml'
+
+# >>> es_read_tier — identical in script/ci-lint, templates/pre-push,
+# templates/check and worktree-sweep/sweep (tests/tier.bats enforces it).
+# Prints "team" or "solo" for the marker file in $1. Accepts plain, "double"-
+# and 'single'-quoted values and trailing comments. A missing file or field
+# means team; any other value warns on stderr and also means team.
+es_read_tier() {
+  local marker="$1" raw value
+  if [ ! -f "$marker" ]; then
+    echo "team"
+    return 0
+  fi
+  raw="$(tr -d '\r' < "$marker" | sed -n 's/^tier:[[:space:]]*//p' | head -n 1)"
+  value="$(printf '%s\n' "$raw" | sed -e 's/[[:space:]]#.*$//' -e 's/[[:space:]]*$//' \
+    -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/")"
+  case "$value" in
+    "") echo "team" ;;
+    team|solo) echo "$value" ;;
+    *)
+      echo "warning: unknown tier '$value' in $marker - treating as team" >&2
+      echo "team"
+      ;;
+  esac
+}
+# <<< es_read_tier
+
+if [ "${ALLOW_PUSH_TO_MAIN:-}" = "1" ]; then
+  exit 0
+fi
+
+tier="team"
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || top=""
+if [ -n "$top" ]; then
+  tier="$(es_read_tier "$top/$MARKER_REL")"
+fi
+
+block() {
+  local branch="$1" reason="${2:-}"
+  echo ""
+  echo "  BLOCKED: Direct push to '$branch' is not allowed."
+  if [ -n "$reason" ]; then
+    echo "  $reason"
+  fi
+  echo "  Create a feature branch and open a pull request instead."
+  echo ""
+  echo "  Override (emergencies only):"
+  echo "    ALLOW_PUSH_TO_MAIN=1 git push origin $branch"
+  echo ""
+  exit 1
+}
+
+while read -r _local_ref local_sha remote_ref remote_sha; do
+  remote_branch="${remote_ref##refs/heads/}"
+  if [[ ! "$remote_branch" =~ $PROTECTED_BRANCH_RE ]]; then
+    continue
+  fi
+
+  if [ "$tier" != "solo" ]; then
+    block "$remote_branch"
+  fi
+
+  # Solo tier: docs-only fast-forward pushes may go to main directly.
+  if [[ "$local_sha" =~ $ZERO_SHA_RE ]] || [[ "$remote_sha" =~ $ZERO_SHA_RE ]]; then
+    block "$remote_branch" "Solo tier: creating or deleting '$remote_branch' is never docs-only."
+  fi
+  if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null || ! git cat-file -e "$local_sha^{commit}" 2>/dev/null; then
+    block "$remote_branch" "Solo tier: cannot compute the pushed range — run 'git fetch' and retry."
+  fi
+  if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    block "$remote_branch" "Solo tier: not a fast-forward of '$remote_branch' — rewriting history is never docs-only."
+  fi
+  # --no-renames lists a rename as deletion + addition, so both paths are
+  # checked; -z keeps unusual file names intact.
+  changed_list="$(mktemp "${TMPDIR:-/tmp}/pre-push.XXXXXX")" || block "$remote_branch" "Solo tier: cannot create a temporary file."
+  if ! git diff --no-renames --name-only -z "$remote_sha" "$local_sha" > "$changed_list" 2>/dev/null; then
+    rm -f "$changed_list"
+    block "$remote_branch" "Solo tier: cannot compute the pushed range — run 'git fetch' and retry."
+  fi
+  non_docs=""
+  while IFS= read -r -d '' path; do
+    if [[ ! "$path" =~ $DOCS_ONLY_PATTERN ]]; then
+      non_docs="$non_docs$path"$'\n'
+    fi
+  done < "$changed_list"
+  rm -f "$changed_list"
+  if [ -n "$non_docs" ]; then
+    echo ""
+    echo "  Solo tier: only docs-only changes may go to '$remote_branch' directly."
+    echo "  Not documentation:"
+    printf '%s' "$non_docs" | sed 's/^/    /'
+    block "$remote_branch"
+  fi
+  echo "pre-push: solo tier — docs-only push to '$remote_branch' allowed."
+done
+
+exit 0
