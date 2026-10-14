@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+
+# Nothing to install: givepw is a single bash script. Tests need bats and shellcheck.
+
+echo "Configuring git hooks..."
+git config core.hooksPath .hooks
+
+echo "Done."

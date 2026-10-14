@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# givepw — hand a secret to a script or AI agent without it touching chat,
+# argv or shell history. A person types the secret into a masked prompt (or a
+# dialog when there is no terminal); givepw stores it in a file, a .env file or
+# the keychain. The consumer reads it and, for files, removes it with
+# `givepw take`.
+#
+# The secret never appears in argv, on stdout/stderr (except `givepw take`),
+# or in a temporary file outside the target. Child processes get it on stdin
+# only. Bash 3.2 compatible.
+#
+# https://github.com/iret77/givepw — MIT License
+set -euo pipefail
+
+GIVEPW_VERSION="0.1.0"
+DEFAULT_FILE="${GIVEPW_DEFAULT_FILE:-$HOME/.ssh-bootstrap-pw}"
+DIALOG_TIMEOUT_DEFAULT=120
+ENV_KEY_RE='^[A-Za-z_][A-Za-z0-9_]*$'
+# Characters every .env consumer reads the same way without quoting.
+ENV_SAFE_RE='^[A-Za-z0-9_./:@%+=,~-]+$'
+
+usage() {
+  cat <<'EOF'
+givepw — type a secret into a file, .env file or keychain, never into chat or argv
+
+Usage:
+  givepw [options] [FILE]                       secret -> FILE (default ~/.ssh-bootstrap-pw)
+  givepw [options] --env ENVFILE KEY            secret -> KEY=... in ENVFILE
+  givepw [options] --keychain SERVICE [--account NAME]
+                                                secret -> macOS keychain / Linux secret-tool
+  givepw take FILE                              print FILE to stdout, then delete it
+
+Input (first that applies):
+  --stdin            read the secret from stdin (trailing newlines are dropped)
+  terminal           masked prompt, one '*' per character (--no-stars: blind)
+  no terminal        macOS: a dialog with a hidden field; Linux with a desktop:
+                     zenity; otherwise givepw exits with status 2
+
+Options:
+  --label TEXT       what to ask for, shown in the prompt or dialog
+  --timeout SEC      dialog timeout in seconds (default 120)
+  --force            overwrite an existing FILE without asking
+  --no-stars         blind terminal input instead of '*'
+  -h, --help         this help
+  --version          print the version
+
+Never pass the secret itself as an argument: it would end up in shell history
+and in the process list. givepw refuses extra arguments for that reason.
+
+Exit status: 0 stored, 1 aborted or rejected input, 2 usage error or no way to ask.
+EOF
+}
+
+die()  { printf 'givepw: %s\n' "$1" >&2; exit "${2:-1}"; }
+note() { printf '%s\n' "$1" >&2; }
+
+platform() { printf '%s' "${GIVEPW_PLATFORM:-$(uname -s)}"; }
+
+# ── take: read once, then delete ────────────────────────────────────────────
+cmd_take() {
+  [ $# -eq 1 ] || die "usage: givepw take FILE" 2
+  local f="$1"
+  [ -f "$f" ] || die "not a regular file: $f" 1
+  [ -r "$f" ] || die "not readable: $f" 1
+  cat -- "$f"
+  if command -v shred >/dev/null 2>&1; then
+    shred -u -- "$f" 2>/dev/null || rm -f -- "$f"
+  else
+    rm -f -- "$f"
+  fi
+  [ ! -e "$f" ] || die "could not delete $f" 1
+}
+
+if [ "${1:-}" = "take" ]; then
+  shift
+  cmd_take "$@"
+  exit 0
+fi
+
+# ── arguments ───────────────────────────────────────────────────────────────
+MODE="file"
+FILE=""
+ENV_FILE=""
+ENV_KEY=""
+KC_SERVICE=""
+KC_ACCOUNT="${USER:-givepw}"
+USE_STDIN=0
+STARS=1
+FORCE=0
+LABEL=""
+TIMEOUT="$DIALOG_TIMEOUT_DEFAULT"
+POSITIONAL=0
+
+refuse_extra() {
+  note "givepw: too many arguments."
+  note "  If you just typed 'givepw <secret>': don't. Run givepw without the secret"
+  note "  and type it at the prompt; arguments land in shell history and the process list."
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)  usage; exit 0 ;;
+    --version)  printf 'givepw %s\n' "$GIVEPW_VERSION"; exit 0 ;;
+    --stdin)    USE_STDIN=1; shift ;;
+    --no-stars) STARS=0; shift ;;
+    --stars)    STARS=1; shift ;;
+    --force)    FORCE=1; shift ;;
+    --label)    [ $# -ge 2 ] || die "--label needs a value" 2; LABEL="$2"; shift 2 ;;
+    --timeout)  [ $# -ge 2 ] || die "--timeout needs a value" 2; TIMEOUT="$2"; shift 2 ;;
+    --env)
+      [ $# -ge 3 ] || die "usage: givepw --env ENVFILE KEY" 2
+      MODE="env"; ENV_FILE="$2"; ENV_KEY="$3"; shift 3 ;;
+    --keychain)
+      [ $# -ge 2 ] || die "usage: givepw --keychain SERVICE [--account NAME]" 2
+      MODE="keychain"; KC_SERVICE="$2"; shift 2 ;;
+    --account)  [ $# -ge 2 ] || die "--account needs a value" 2; KC_ACCOUNT="$2"; shift 2 ;;
+    --)         shift
+                [ $# -le 1 ] || refuse_extra
+                if [ $# -eq 1 ]; then [ "$POSITIONAL" -eq 0 ] || refuse_extra; FILE="$1"; POSITIONAL=1; shift; fi ;;
+    -*)         die "unknown option: $1 (see givepw --help)" 2 ;;
+    *)
+      [ "$POSITIONAL" -eq 0 ] || refuse_extra
+      FILE="$1"; POSITIONAL=1; shift ;;
+  esac
+done
+
+case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a number of seconds" 2 ;; esac
+
+case "$MODE" in
+  file)
+    FILE="${FILE:-$DEFAULT_FILE}"
+    ;;
+  env)
+    [ "$POSITIONAL" -eq 0 ] || refuse_extra
+    printf '%s' "$ENV_KEY" | grep -Eq "$ENV_KEY_RE" || die "not a valid variable name: $ENV_KEY" 2
+    FILE="$ENV_FILE"
+    ;;
+  keychain)
+    [ "$POSITIONAL" -eq 0 ] || refuse_extra
+    [ -n "$KC_SERVICE" ] || die "--keychain needs a service name" 2
+    ;;
+esac
+
+if [ "$MODE" != keychain ]; then
+  parent=$(dirname -- "$FILE")
+  [ -d "$parent" ] || die "directory does not exist: $parent" 1
+  [ -w "$parent" ] || die "directory not writable: $parent" 1
+  [ ! -d "$FILE" ] || die "is a directory: $FILE" 1
+fi
+
+[ -n "$LABEL" ] || case "$MODE" in
+  file)     LABEL="Secret for $FILE" ;;
+  env)      LABEL="Secret for $ENV_KEY in $ENV_FILE" ;;
+  keychain) LABEL="Secret for keychain item $KC_SERVICE" ;;
+esac
+
+# ── input channels ──────────────────────────────────────────────────────────
+TTY_IN=""
+if [ "$USE_STDIN" -eq 0 ]; then
+  # GIVEPW_NO_TTY=1 ignores any terminal (tests, unattended callers).
+  if [ "${GIVEPW_NO_TTY:-0}" = 1 ]; then
+    :
+  elif [ -t 0 ]; then
+    TTY_IN=/dev/stdin
+  elif { : < /dev/tty; } 2>/dev/null; then
+    TTY_IN=/dev/tty
+  fi
+fi
+
+ask_yes_no() {  # $1 question; terminal only
+  local yn=""
+  printf '%s [y/N] ' "$1" >&2
+  IFS= read -r yn < "$TTY_IN" || true
+  case "$yn" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+
+if [ "$MODE" = file ] && [ -e "$FILE" ] && [ "$FORCE" -eq 0 ]; then
+  if [ -n "$TTY_IN" ]; then
+    ask_yes_no "$FILE exists. Overwrite?" || die "aborted, $FILE unchanged" 1
+  else
+    die "$FILE exists; pass --force to overwrite" 1
+  fi
+fi
+
+SECRET=""
+STTY_SAVED=""
+restore_tty() {
+  if [ -n "$STTY_SAVED" ]; then stty "$STTY_SAVED" < "$TTY_IN" 2>/dev/null || true; fi
+  STTY_SAVED=""
+}
+
+read_masked() {
+  local ch
+  printf '%s: ' "$LABEL" >&2
+  STTY_SAVED=$(stty -g < "$TTY_IN" 2>/dev/null || true)
+  trap 'restore_tty; printf "\n" >&2; exit 130' INT TERM
+  stty -echo < "$TTY_IN" 2>/dev/null || true
+  while IFS= read -r -n1 ch < "$TTY_IN"; do
+    [ -z "$ch" ] && break
+    case "$ch" in
+      $'\177'|$'\b')
+        if [ -n "$SECRET" ]; then SECRET="${SECRET%?}"; printf '\b \b' >&2; fi ;;
+      *)
+        SECRET="$SECRET$ch"; printf '*' >&2 ;;
+    esac
+  done
+  restore_tty
+  trap - INT TERM
+  printf '\n' >&2
+}
+
+read_blind() {
+  printf '%s: ' "$LABEL" >&2
+  IFS= read -rs SECRET < "$TTY_IN" || true
+  printf '\n' >&2
+}
+
+read_stdin() {
+  # Whole stdin; command substitution drops trailing newlines (documented).
+  SECRET=$(cat)
+}
+
+read_dialog_macos() {
+  command -v osascript >/dev/null 2>&1 || return 3
+  SECRET=$(osascript \
+    -e 'on run argv' \
+    -e 'set r to display dialog (item 1 of argv) default answer "" with hidden answer with title "givepw" buttons {"Cancel", "OK"} default button "OK" giving up after ((item 2 of argv) as integer)' \
+    -e 'if gave up of r then return ""' \
+    -e 'return text returned of r' \
+    -e 'end run' "$LABEL" "$TIMEOUT" 2>/dev/null) || die "dialog cancelled" 1
+}
+
+read_dialog_linux() {
+  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 3
+  command -v zenity >/dev/null 2>&1 || return 3
+  SECRET=$(zenity --password --title "givepw: $LABEL" --timeout "$TIMEOUT" 2>/dev/null) || die "dialog cancelled" 1
+}
+
+if [ "$USE_STDIN" -eq 1 ]; then
+  read_stdin
+elif [ -n "$TTY_IN" ]; then
+  if [ "$STARS" -eq 1 ]; then read_masked; else read_blind; fi
+else
+  rc=0
+  case "$(platform)" in
+    Darwin) read_dialog_macos || rc=$? ;;
+    *)      read_dialog_linux || rc=$? ;;
+  esac
+  if [ "$rc" -eq 3 ]; then
+    note "givepw: no terminal and no dialog available."
+    note "  Run givepw in a terminal, or pipe the secret in with --stdin."
+    exit 2
+  fi
+fi
+
+[ -n "$SECRET" ] || die "empty secret, nothing stored" 1
+
+# ── targets ─────────────────────────────────────────────────────────────────
+umask 077
+
+store_file() {
+  local tmp="$FILE.givepw.$$"
+  : > "$tmp"
+  chmod 600 "$tmp"
+  printf '%s' "$SECRET" > "$tmp"
+  mv -f -- "$tmp" "$FILE"
+  chmod 600 "$FILE"
+  note "✓ stored in $FILE (mode 600). Read it once with: givepw take $FILE"
+}
+
+store_env() {
+  case "$SECRET" in *$'\n'*) die "secret contains a newline; .env cannot hold it, use the file target" 1 ;; esac
+  # Only a charset every .env consumer reads identically (docker --env-file keeps
+  # quotes, dotenv strips them). Anything else: use the file target.
+  printf '%s' "$SECRET" | grep -Eq "$ENV_SAFE_RE" \
+    || die "secret has characters .env consumers read differently; use the file target" 1
+  local tmp="$FILE.givepw.$$" line done=0
+  : > "$tmp"
+  chmod 600 "$tmp"
+  if [ -f "$FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "$ENV_KEY="*)
+          if [ "$done" -eq 0 ]; then printf '%s=%s\n' "$ENV_KEY" "$SECRET" >> "$tmp"; done=1; fi ;;
+        "export $ENV_KEY="*)
+          if [ "$done" -eq 0 ]; then printf 'export %s=%s\n' "$ENV_KEY" "$SECRET" >> "$tmp"; done=1; fi ;;
+        *)
+          printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$FILE"
+  fi
+  [ "$done" -eq 1 ] || printf '%s=%s\n' "$ENV_KEY" "$SECRET" >> "$tmp"
+  mv -f -- "$tmp" "$FILE"
+  chmod 600 "$FILE"
+  note "✓ $ENV_KEY stored in $FILE (mode 600)"
+}
+
+kc_quote() {  # escape for `security -i` double quotes
+  local v="$1"
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '"%s"' "$v"
+}
+
+store_keychain() {
+  case "$(platform)" in
+    Darwin)
+      command -v security >/dev/null 2>&1 || die "security(1) not found" 1
+      case "$SECRET$KC_SERVICE$KC_ACCOUNT" in *$'\n'*) die "keychain values cannot contain newlines" 1 ;; esac
+      # Command goes over stdin: argv of security(1) is just "-i".
+      printf 'add-generic-password -U -s %s -a %s -w %s\n' \
+        "$(kc_quote "$KC_SERVICE")" "$(kc_quote "$KC_ACCOUNT")" "$(kc_quote "$SECRET")" \
+        | security -i >/dev/null 2>&1 || true
+      # Read back and compare (the value travels over a pipe, not argv). security(1)
+      # prints non-ASCII values as hex, so those are only checked for existence.
+      local got
+      got=$(security find-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" -w 2>/dev/null) \
+        || die "keychain item was not stored" 1
+      if [ "$got" != "$SECRET" ] && printf "%s" "$SECRET" | LC_ALL=C grep -q "^[ -~]*$"; then
+        got=""; die "keychain item has a different value; not stored" 1
+      fi
+      got=""
+      note "✓ stored in the keychain: service $KC_SERVICE, account $KC_ACCOUNT"
+      note "  read it with: security find-generic-password -s '$KC_SERVICE' -a '$KC_ACCOUNT' -w"
+      ;;
+    *)
+      command -v secret-tool >/dev/null 2>&1 || die "secret-tool not found (package libsecret-tools)" 1
+      printf '%s' "$SECRET" | secret-tool store --label "givepw: $KC_SERVICE" \
+        service "$KC_SERVICE" account "$KC_ACCOUNT" || die "secret-tool failed" 1
+      note "✓ stored with secret-tool: service $KC_SERVICE, account $KC_ACCOUNT"
+      note "  read it with: secret-tool lookup service '$KC_SERVICE' account '$KC_ACCOUNT'"
+      ;;
+  esac
+}
+
+case "$MODE" in
+  file)     store_file ;;
+  env)      store_env ;;
+  keychain) store_keychain ;;
+esac
+SECRET=""
