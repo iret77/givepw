@@ -45,6 +45,7 @@ givepw [FILE]                                  # file, mode 600, no trailing new
 givepw --env .env API_TOKEN                    # set API_TOKEN=... in .env (mode 600)
 givepw --keychain my-service --account me      # macOS keychain / Linux secret-tool
 givepw take FILE                               # print FILE, then delete it
+givepw --to devhost ~/.synology-pw            # ask here, store on devhost (over ssh)
 ```
 
 Without `FILE`, the secret goes to `~/.ssh-bootstrap-pw` (override with
@@ -61,6 +62,17 @@ Without `FILE`, the secret goes to `~/.ssh-bootstrap-pw` (override with
 
 **Options:** `--label TEXT` (what to ask for), `--force` (overwrite an existing
 file), `--account NAME` (keychain account, default `$USER`).
+
+### Remote hosts: `--to HOST`
+
+Ask on the machine you sit at, store on another one: `givepw --to HOST [target]`.
+HOST is an ssh alias or `user@host`; givepw must be installed there. Before the
+prompt, givepw checks that `ssh HOST givepw --version` works. The secret then goes over
+the ssh channel on stdin into `givepw --stdin` on HOST; neither side has it in argv.
+`~/` in remote paths expands on HOST. An existing remote file needs `--force`.
+
+Without `--to`, givepw over ssh works like anywhere else: with a terminal
+(`ssh -t host givepw FILE`) you get the masked prompt, without one it exits 2.
 
 **Exit status:** 0 stored, 1 aborted or rejected input, 2 usage error or no
 way to ask.

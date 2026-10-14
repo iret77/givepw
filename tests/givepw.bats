@@ -11,8 +11,10 @@
 #  A8 `givepw take FILE` prints exactly the content and the file is gone
 #  A9 no terminal, no --stdin, no dialog: exit 2 with a hint
 #  A10 everything passes under /bin/bash 3.2 (macOS) and bash 5 (Linux)
+#  A11 --to HOST: the secret reaches the remote givepw on ssh stdin only;
+#      nothing is sent if ssh or givepw on HOST is not reachable
 
-# shellcheck disable=SC2016  # stub bodies are literal shell code
+# shellcheck disable=SC2016,SC2088  # stub bodies are literal shell code; ~ is for the remote side
 GIVEPW="$BATS_TEST_DIRNAME/../givepw"
 SECRET='s3cr3t-Value_42'
 
@@ -222,4 +224,60 @@ no_secret_in_argv() {
   [[ "$output" == *"givepw take FILE"* ]]
   run bash "$GIVEPW" --version
   [[ "$output" =~ ^givepw\ [0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+# ── --to HOST: ask here, store remotely over ssh stdin ──────────────────────
+# ssh stub: last argument is the remote command. "--version" = pre-check.
+ssh_stub() {
+  stub ssh 'for a; do cmd="$a"; done
+case "$cmd" in
+  *--version*) printf "%s\n" "$cmd" > "$STUB_LOG/ssh.precheck"; exit "${SSH_PRECHECK_RC:-0}" ;;
+  *) printf "%s\n" "$cmd" > "$STUB_LOG/ssh.cmd"; cat > "$STUB_LOG/ssh.stdin"; exit "${SSH_RC:-0}" ;;
+esac'
+}
+
+@test "--to: secret goes over ssh stdin, argv has only the target" {
+  ssh_stub
+  run bash "$GIVEPW" --stdin --to devhost '~/.x' <<< "$SECRET"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$STUB_LOG/ssh.stdin")" = "$SECRET" ]
+  [ "$(cat "$STUB_LOG/ssh.cmd")" = "env PATH=\"\$HOME/.local/bin:\$PATH\" givepw --stdin -- ~/'.x'" ]
+  grep -q -- '-n -T -o BatchMode=yes' "$STUB_LOG/ssh.argv"
+  no_secret_in_argv
+  [ ! -e "$HOME/.x" ]
+  [[ "$output" != *"$SECRET"* ]]
+}
+
+@test "--to: --force, .env target and quoting are forwarded" {
+  ssh_stub
+  bash "$GIVEPW" --stdin --force --to me@host.example --env "/srv/a'b/.env" API_TOKEN <<< "$SECRET"
+  [ "$(cat "$STUB_LOG/ssh.cmd")" = "env PATH=\"\$HOME/.local/bin:\$PATH\" givepw --stdin --force --env '/srv/a'\\''b/.env' 'API_TOKEN'" ]
+}
+
+@test "--to without FILE uses the remote default" {
+  ssh_stub
+  bash "$GIVEPW" --stdin --to devhost <<< "$SECRET"
+  [ "$(cat "$STUB_LOG/ssh.cmd")" = "env PATH=\"\$HOME/.local/bin:\$PATH\" givepw --stdin" ]
+}
+
+@test "--to: failed pre-check stops before anything is sent" {
+  ssh_stub
+  SSH_PRECHECK_RC=255 run bash "$GIVEPW" --stdin --to devhost '~/.x' <<< "$SECRET"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"install.sh"* ]]
+  [ ! -e "$STUB_LOG/ssh.stdin" ]
+}
+
+@test "--to: remote failure is reported" {
+  ssh_stub
+  SSH_RC=1 run bash "$GIVEPW" --stdin --to devhost '~/.x' <<< "$SECRET"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"did not store"* ]]
+}
+
+@test "--to: host that looks like an option is refused" {
+  ssh_stub
+  run bash "$GIVEPW" --stdin --to '-oProxyCommand=x' '~/.x' <<< "$SECRET"
+  [ "$status" -eq 2 ]
+  [ ! -e "$STUB_LOG/ssh.argv" ]
 }
