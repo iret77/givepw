@@ -28,10 +28,14 @@ worked without reading the secret: `test -s FILE` or, for `.env`,
 `grep -q '^API_TOKEN=' path/to/.env`.
 
 **macOS, no terminal of your own:** you may run `givepw --force --label "…" FILE`
-yourself. It opens a dialog on the user's screen; tell the user before you run
+yourself. If the secret is needed on another host, add `--to HOST`
+(e.g. `givepw --to devhost --force ~/.myservice-pw`): the dialog appears on the user's Mac,
+the secret goes over ssh into givepw on that host. It opens a dialog on the user's screen; tell the user before you run
 it. Exit status 1 means they cancelled or the dialog timed out — ask, don't retry
 in a loop. Exit status 2 means there is no way to ask (headless Linux): ask the
-user to run the command in their terminal.
+user to run the command in their terminal. On a remote host without a terminal of your
+own, ask the user to run it in a terminal on that host, or, from their Mac,
+`givepw --to HOST FILE`.
 
 ## Use it
 

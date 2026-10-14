@@ -2,6 +2,15 @@
 
 [SemVer](https://semver.org/) and [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — unreleased
+
+### Added
+
+- `--to HOST`: ask on this machine (terminal or macOS dialog), store on HOST. The secret
+  travels over the ssh channel on stdin into `givepw --stdin` there; argv on both sides
+  only carries the target. givepw checks ssh and givepw on HOST before anyone types.
+  Works with all targets (file, `--env`, `--keychain`); `~/` in paths expands remotely.
+
 ## [0.1.0] — unreleased
 
 First public version, grown out of a private helper script.

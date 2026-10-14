@@ -12,12 +12,17 @@
 # https://github.com/iret77/givepw — MIT License
 set -euo pipefail
 
-GIVEPW_VERSION="0.1.0"
+GIVEPW_VERSION="0.2.0"
 DEFAULT_FILE="${GIVEPW_DEFAULT_FILE:-$HOME/.ssh-bootstrap-pw}"
 DIALOG_TIMEOUT_DEFAULT=120
 ENV_KEY_RE='^[A-Za-z_][A-Za-z0-9_]*$'
 # Characters every .env consumer reads the same way without quoting.
 ENV_SAFE_RE='^[A-Za-z0-9_./:@%+=,~-]+$'
+HOST_RE='^[A-Za-z0-9_][A-Za-z0-9_.@-]*$'
+SSH_OPTS="-T -o BatchMode=yes -o ConnectTimeout=10"
+# Remote shells (bash, zsh, fish) often lack ~/.local/bin in non-interactive PATH.
+# shellcheck disable=SC2016  # expands on the remote side, on purpose
+REMOTE_GIVEPW='env PATH="$HOME/.local/bin:$PATH" givepw'
 
 usage() {
   cat <<'EOF'
@@ -29,6 +34,7 @@ Usage:
   givepw [options] --keychain SERVICE [--account NAME]
                                                 secret -> macOS keychain / Linux secret-tool
   givepw take FILE                              print FILE to stdout, then delete it
+  givepw --to HOST [target]                     ask here, store on HOST (over ssh, via stdin)
 
 Input (first that applies):
   --stdin            read the secret from stdin (trailing newlines are dropped)
@@ -40,6 +46,7 @@ Options:
   --label TEXT       what to ask for, shown in the prompt or dialog
   --timeout SEC      dialog timeout in seconds (default 120)
   --force            overwrite an existing FILE without asking
+  --to HOST          store the secret on HOST (ssh alias or user@host); needs givepw there
   --no-stars         blind terminal input instead of '*'
   -h, --help         this help
   --version          print the version
@@ -84,6 +91,8 @@ ENV_FILE=""
 ENV_KEY=""
 KC_SERVICE=""
 KC_ACCOUNT="${USER:-givepw}"
+KC_ACCOUNT_SET=0
+TO_HOST=""
 USE_STDIN=0
 STARS=1
 FORCE=0
@@ -114,7 +123,8 @@ while [ $# -gt 0 ]; do
     --keychain)
       [ $# -ge 2 ] || die "usage: givepw --keychain SERVICE [--account NAME]" 2
       MODE="keychain"; KC_SERVICE="$2"; shift 2 ;;
-    --account)  [ $# -ge 2 ] || die "--account needs a value" 2; KC_ACCOUNT="$2"; shift 2 ;;
+    --account)  [ $# -ge 2 ] || die "--account needs a value" 2; KC_ACCOUNT="$2"; KC_ACCOUNT_SET=1; shift 2 ;;
+    --to)       [ $# -ge 2 ] || die "--to needs a host" 2; TO_HOST="$2"; shift 2 ;;
     --)         shift
                 [ $# -le 1 ] || refuse_extra
                 if [ $# -eq 1 ]; then [ "$POSITIONAL" -eq 0 ] || refuse_extra; FILE="$1"; POSITIONAL=1; shift; fi ;;
@@ -129,7 +139,7 @@ case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a number of seconds" 2 ;;
 
 case "$MODE" in
   file)
-    FILE="${FILE:-$DEFAULT_FILE}"
+    [ -n "$TO_HOST" ] || FILE="${FILE:-$DEFAULT_FILE}"
     ;;
   env)
     [ "$POSITIONAL" -eq 0 ] || refuse_extra
@@ -142,7 +152,9 @@ case "$MODE" in
     ;;
 esac
 
-if [ "$MODE" != keychain ]; then
+if [ -n "$TO_HOST" ]; then
+  printf '%s' "$TO_HOST" | grep -Eq "$HOST_RE" || die "not a valid host: $TO_HOST" 2
+elif [ "$MODE" != keychain ]; then
   parent=$(dirname -- "$FILE")
   [ -d "$parent" ] || die "directory does not exist: $parent" 1
   [ -w "$parent" ] || die "directory not writable: $parent" 1
@@ -150,9 +162,9 @@ if [ "$MODE" != keychain ]; then
 fi
 
 [ -n "$LABEL" ] || case "$MODE" in
-  file)     LABEL="Secret for $FILE" ;;
-  env)      LABEL="Secret for $ENV_KEY in $ENV_FILE" ;;
-  keychain) LABEL="Secret for keychain item $KC_SERVICE" ;;
+  file)     LABEL="Secret for ${TO_HOST:+$TO_HOST:}${FILE:-(default file)}" ;;
+  env)      LABEL="Secret for $ENV_KEY in ${TO_HOST:+$TO_HOST:}$ENV_FILE" ;;
+  keychain) LABEL="Secret for keychain item $KC_SERVICE${TO_HOST:+ on $TO_HOST}" ;;
 esac
 
 # ── input channels ──────────────────────────────────────────────────────────
@@ -175,7 +187,15 @@ ask_yes_no() {  # $1 question; terminal only
   case "$yn" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 
-if [ "$MODE" = file ] && [ -e "$FILE" ] && [ "$FORCE" -eq 0 ]; then
+# Remote target: check ssh and givepw there before anyone types a secret.
+# -n keeps ssh away from our stdin (it may carry the secret).
+if [ -n "$TO_HOST" ]; then
+  # shellcheck disable=SC2086  # SSH_OPTS is a fixed, unquoted option list
+  ssh -n $SSH_OPTS "$TO_HOST" "$REMOTE_GIVEPW --version" >/dev/null 2>&1 \
+    || die "cannot run givepw on $TO_HOST over ssh. Install it there: curl -fsSL https://raw.githubusercontent.com/iret77/givepw/main/install.sh | bash" 1
+fi
+
+if [ -z "$TO_HOST" ] && [ "$MODE" = file ] && [ -e "$FILE" ] && [ "$FORCE" -eq 0 ]; then
   if [ -n "$TTY_IN" ]; then
     ask_yes_no "$FILE exists. Overwrite?" || die "aborted, $FILE unchanged" 1
   else
@@ -334,9 +354,35 @@ store_keychain() {
   esac
 }
 
-case "$MODE" in
-  file)     store_file ;;
-  env)      store_env ;;
-  keychain) store_keychain ;;
-esac
+# sq: single-quote for a POSIX/fish remote shell. rq: same, but keeps a
+# leading ~/ unquoted so the remote shell expands it.
+sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# shellcheck disable=SC2088  # the ~ is literal here; the remote shell expands it
+rq() { case "$1" in "~/"*) printf '~/%s' "$(sq "${1#\~/}")" ;; *) sq "$1" ;; esac; }
+
+store_remote() {
+  local args="--stdin" rc=0
+  [ "$FORCE" -eq 0 ] || args="$args --force"
+  case "$MODE" in
+    file)     [ -z "$FILE" ] || args="$args -- $(rq "$FILE")" ;;
+    env)      args="$args --env $(rq "$ENV_FILE") $(sq "$ENV_KEY")" ;;
+    keychain) args="$args --keychain $(sq "$KC_SERVICE")"
+              [ "$KC_ACCOUNT_SET" -eq 0 ] || args="$args --account $(sq "$KC_ACCOUNT")" ;;
+  esac
+  # The secret goes over the ssh channel on stdin; argv of ssh and of the remote
+  # givepw only carry the target.
+  # shellcheck disable=SC2086,SC2029  # fixed option list; command is built for the remote side
+  printf '%s' "$SECRET" | ssh $SSH_OPTS "$TO_HOST" "$REMOTE_GIVEPW $args" || rc=$?
+  [ "$rc" -eq 0 ] || die "givepw on $TO_HOST did not store the secret (exit $rc)" 1
+}
+
+if [ -n "$TO_HOST" ]; then
+  store_remote
+else
+  case "$MODE" in
+    file)     store_file ;;
+    env)      store_env ;;
+    keychain) store_keychain ;;
+  esac
+fi
 SECRET=""
